@@ -231,6 +231,10 @@ impl<T: Listener> MultiClientServer<T> {
         // unbounded mesh queue is not growing (stays at 1 when the consumer
         // keeps up) and to surface it if it ever does.
         let mut dirty_backlog_max = 0usize;
+        // Cap on coalesced dirty rects per broadcast. Above this we skip the
+        // broadcast and force a full refresh (bounded by the screen) instead of
+        // shipping an unbounded list. ~16 KB at 16 bytes/rect.
+        const MAX_COALESCED_DIRTY_RECTS: usize = 1000;
 
         // Force the device to a known state on (re)start: no clients yet, so
         // the guest should not be reporting updates.
@@ -392,11 +396,30 @@ impl<T: Listener> MultiClientServer<T> {
                     } else {
                         tracing::trace!(backlog, "device dirty channel drained");
                     }
-                    // Broadcast each drained message individually so behavior is
-                    // identical to receiving them one at a time. Arc avoids
-                    // cloning the rect Vec per client (only a ref-count bump).
-                    for rects in batch {
-                        let rects = Arc::new(rects);
+                    // Coalesce the drained batch into one broadcast: a backlog
+                    // of N messages costs one broadcast, not N. Concatenating is
+                    // lossless because each client merges rects into its own
+                    // bitmap before encoding.
+                    let merged: Vec<video_core::DirtyRect> = batch.into_iter().flatten().collect();
+                    if merged.len() > MAX_COALESCED_DIRTY_RECTS {
+                        // Pathologically large dirty set (the producer far
+                        // outran us, or a heavily fragmented update). Bound the
+                        // work: skip the broadcast and have every client do one
+                        // full refresh, which is capped by the screen size. Each
+                        // client's poll tick picks up missed_dirty on its next
+                        // pass.
+                        tracing::debug!(
+                            rects = merged.len(),
+                            cap = MAX_COALESCED_DIRTY_RECTS,
+                            "coalesced dirty exceeds cap, forcing full refresh"
+                        );
+                        for s in &mut self.dirty_senders {
+                            s.missed_dirty.store(true, Ordering::Relaxed);
+                        }
+                    } else {
+                        // Arc avoids cloning the rect Vec per client (ref-count
+                        // bump only).
+                        let rects = Arc::new(merged);
                         for s in &mut self.dirty_senders {
                             if s.sender.try_send(Arc::clone(&rects)).is_err() {
                                 s.missed_dirty.store(true, Ordering::Relaxed);
@@ -409,7 +432,7 @@ impl<T: Listener> MultiClientServer<T> {
                         tracing::trace!(
                             rect_count = rects.len(),
                             clients = self.dirty_senders.len(),
-                            "broadcast device dirty rects"
+                            "broadcast coalesced device dirty rects"
                         );
                     }
                 }
@@ -876,16 +899,12 @@ mod tests {
         // Dirt arriving while idle re-asserts "not needed": this is the
         // self-heal for a device that re-handshaked and returned to its
         // enabled default while a client is not connected.
-        server
-            .dirty_send
-            .as_ref()
-            .unwrap()
-            .send(vec![DirtyRect {
-                left: 0,
-                top: 0,
-                right: 16,
-                bottom: 16,
-            }]);
+        server.dirty_send.as_ref().unwrap().send(vec![DirtyRect {
+            left: 0,
+            top: 0,
+            right: 16,
+            bottom: 16,
+        }]);
         assert!(!wait_for_signal(&mut server.updates_needed_recv));
 
         server.stop();
