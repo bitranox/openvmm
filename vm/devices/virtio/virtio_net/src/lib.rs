@@ -520,6 +520,10 @@ struct ProcessingData {
     tx_done: Box<[TxId]>,
     #[inspect(skip)]
     rx_ready: Box<[RxId]>,
+    /// Buffers handed to the backend by one `process_virtio_rx` pass, retained so
+    /// the pass does not allocate. Bounded by the receive queue size.
+    #[inspect(skip)]
+    rx_avail: Vec<RxId>,
 }
 
 impl ProcessingData {
@@ -528,6 +532,7 @@ impl ProcessingData {
             tx_segments: Vec::new(),
             tx_done: vec![TxId(0); tx_queue_size as usize].into(),
             rx_ready: vec![RxId(0); rx_queue_size as usize].into(),
+            rx_avail: Vec::with_capacity(rx_queue_size as usize),
         }
     }
 }
@@ -1338,8 +1343,10 @@ impl Worker {
         epqueue: &mut dyn net_backend::Queue,
         check: &task_control::StopCheck<'_>,
     ) -> Result<bool, WorkerError> {
-        // Fill the receive queue with any available buffers.
-        let mut rx_ids = Vec::new();
+        // Fill the receive queue with any available buffers. The id buffer comes
+        // from the worker's scratch space and goes back below.
+        let mut rx_ids = std::mem::take(&mut self.active_state.data.rx_avail);
+        rx_ids.clear();
         let cancelled = loop {
             // Rejected buffers complete inline and can be reposted, so queue
             // capacity does not bound this loop.
@@ -1373,6 +1380,10 @@ impl Worker {
         if did_work {
             epqueue.rx_avail(&mut self.active_state.pending_rx_packets, rx_ids.as_slice());
         }
+        // Hand the buffer back for the next pass. The queue error path above
+        // drops it; that tears the worker down anyway.
+        rx_ids.clear();
+        self.active_state.data.rx_avail = rx_ids;
         if let Some(cancelled) = cancelled {
             return Err(cancelled.into());
         }
